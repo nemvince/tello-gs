@@ -1,0 +1,51 @@
+#pragma once
+
+#include <stdint.h>
+#include <stdbool.h>
+
+/* One normalised landmark (coordinates in [0,1] relative to frame). */
+typedef struct
+{
+    float x, y, z;
+} Landmark;
+
+/* 21 MediaPipe hand landmarks. valid == false when no hand detected. */
+typedef struct
+{
+    Landmark pts[21];
+    bool valid;
+} HandLandmarks;
+
+/*
+ * RC override produced by a tracking algorithm.
+ * When active is true the main loop uses these values instead of
+ * manual input for roll/pitch/throttle/yaw.
+ */
+typedef struct
+{
+    int roll, pitch, throttle, yaw; /* -100 .. 100 */
+    bool active;
+} TrackerOutput;
+
+/* Called once from main() before the main loop starts. */
+void tracker_init(void);
+
+/*
+ * Called from the video thread on every decoded frame (RGB24, row-major).
+ * Must be thread-safe and return quickly.
+ */
+void tracker_process_frame(const uint8_t *rgb, int w, int h);
+
+/* Enable / disable tracking mode. When disabled, TrackerOutput.active is
+ * always false and no RC overrides are generated. */
+void tracker_set_enabled(bool enabled);
+bool tracker_is_enabled(void);
+
+/* Thread-safe snapshot of the latest RC override. */
+TrackerOutput tracker_get_output(void);
+
+/* Thread-safe snapshot of the latest detected landmarks (for HUD). */
+HandLandmarks tracker_get_landmarks(void);
+
+/* Called once from main() during shutdown. */
+void tracker_cleanup(void);
