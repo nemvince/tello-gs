@@ -495,11 +495,13 @@ static PalmBox run_palm_detector(const uint8_t *rgb, int fw, int fh,
 
 #define CROP_SCALE 1.5f /* expand palm box for landmark crop */
 #define PRESENCE_THRESH 0.5f
+#define RETRACK_PRESENCE_THRESH 0.8f /* stricter when re-tracking to avoid ghost locks */
 
 static bool run_landmark_model(const uint8_t *rgb, int fw, int fh,
                                const PalmBox *palm,
                                float *input_buf,
-                               HandLandmarks *out_lm)
+                               HandLandmarks *out_lm,
+                               float thresh)
 {
     out_lm->valid = false;
     if (!lmark_session)
@@ -558,7 +560,7 @@ static bool run_landmark_model(const uint8_t *rgb, int fw, int fh,
     g_debug.hand_presence = hand_presence;
     pthread_mutex_unlock(&out_mtx);
 
-    if (hand_presence >= PRESENCE_THRESH)
+    if (hand_presence >= thresh)
     {
         /*
          * Project landmarks from 224-pixel crop space to normalised frame coords.
@@ -796,7 +798,9 @@ static void *worker_thread(void *arg)
         /* ---- Stage 2: Landmark model ---- */
         HandLandmarks lm = {0};
         bool lm_ok = run_landmark_model(f->data, f->w, f->h,
-                                        &palm, lmark_buf, &lm);
+                                        &palm, lmark_buf, &lm,
+                                        used_retrack ? RETRACK_PRESENCE_THRESH
+                                                     : PRESENCE_THRESH);
 
         if (!lm_ok && used_retrack)
         {
@@ -808,7 +812,8 @@ static void *worker_thread(void *arg)
             if (palm.score > 0.0f)
             {
                 lm_ok = run_landmark_model(f->data, f->w, f->h,
-                                           &palm, lmark_buf, &lm);
+                                           &palm, lmark_buf, &lm,
+                                           PRESENCE_THRESH);
             }
         }
 
@@ -835,11 +840,11 @@ static void *worker_thread(void *arg)
 
         lost_frames = 0;
 
+        /* Save raw landmarks for next-frame re-tracking (before smoothing) */
+        prev_lm = lm;
+
         /* ---- EMA smoothing ---- */
         ema_smooth_landmarks(&lm);
-
-        /* Save for next-frame re-tracking */
-        prev_lm = lm;
 
         /* ---- Stage 3: Gesture identification (READ-ONLY, no drone commands) ---- */
         GestureID gesture = gesture_identify(&lm);
