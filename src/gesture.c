@@ -28,20 +28,51 @@
 #define LM_PINKY_DIP 19
 #define LM_PINKY_TIP 20
 
-/* Returns true when a finger (not thumb) is extended:
- * tip is higher (smaller Y) than the PIP joint. */
-static bool finger_extended(const HandLandmarks *lm, int tip, int pip)
+/* Returns true when a finger (not thumb) is extended.
+ * Uses the angle at the PIP joint: if the DIP-PIP-MCP angle is roughly
+ * straight (> ~150°), the finger is extended. This works regardless of
+ * hand rotation, unlike a simple Y-comparison. */
+static bool finger_extended(const HandLandmarks *lm, int mcp, int pip, int dip, int tip)
 {
-  return lm->pts[tip].y < lm->pts[pip].y;
+  (void)tip;
+  /* Vector PIP→MCP */
+  float ax = lm->pts[mcp].x - lm->pts[pip].x;
+  float ay = lm->pts[mcp].y - lm->pts[pip].y;
+  /* Vector PIP→DIP */
+  float bx = lm->pts[dip].x - lm->pts[pip].x;
+  float by = lm->pts[dip].y - lm->pts[pip].y;
+
+  float dot = ax * bx + ay * by;
+  float mag_a = sqrtf(ax * ax + ay * ay);
+  float mag_b = sqrtf(bx * bx + by * by);
+  if (mag_a < 1e-6f || mag_b < 1e-6f)
+    return false;
+
+  float cos_angle = dot / (mag_a * mag_b);
+  /* cos(160°) ≈ -0.94, cos(150°) ≈ -0.87.
+   * Bent finger: cos_angle is positive (small angle at PIP).
+   * Straight finger: cos_angle is very negative (close to 180°).
+   * Threshold: cos < -0.5 means angle > ~120° → extended. */
+  return cos_angle < -0.5f;
 }
 
-/* Thumb extension: tip is further from the wrist in X than the MCP.
- * Use absolute X distance to handle both left and right hands. */
+/* Thumb extension: use angle at MCP joint (CMC→MCP→IP).
+ * Same logic as fingers — if the joint is roughly straight, thumb is out. */
 static bool thumb_extended(const HandLandmarks *lm)
 {
-  float tip_dist = fabsf(lm->pts[LM_THUMB_TIP].x - lm->pts[LM_WRIST].x);
-  float mcp_dist = fabsf(lm->pts[LM_THUMB_MCP].x - lm->pts[LM_WRIST].x);
-  return tip_dist > mcp_dist * 1.2f;
+  float ax = lm->pts[LM_THUMB_CMC].x - lm->pts[LM_THUMB_MCP].x;
+  float ay = lm->pts[LM_THUMB_CMC].y - lm->pts[LM_THUMB_MCP].y;
+  float bx = lm->pts[LM_THUMB_IP].x - lm->pts[LM_THUMB_MCP].x;
+  float by = lm->pts[LM_THUMB_IP].y - lm->pts[LM_THUMB_MCP].y;
+
+  float dot = ax * bx + ay * by;
+  float mag_a = sqrtf(ax * ax + ay * ay);
+  float mag_b = sqrtf(bx * bx + by * by);
+  if (mag_a < 1e-6f || mag_b < 1e-6f)
+    return false;
+
+  float cos_angle = dot / (mag_a * mag_b);
+  return cos_angle < -0.3f; /* thumb has wider natural angle, use looser threshold */
 }
 
 /* Debounce state per gesture */
@@ -62,10 +93,10 @@ GestureID gesture_classify(const HandLandmarks *lm, uint32_t now_ms)
     return GESTURE_NONE;
   }
 
-  bool idx = finger_extended(lm, LM_INDEX_TIP, LM_INDEX_PIP);
-  bool mid = finger_extended(lm, LM_MIDDLE_TIP, LM_MIDDLE_PIP);
-  bool ring = finger_extended(lm, LM_RING_TIP, LM_RING_PIP);
-  bool pinky = finger_extended(lm, LM_PINKY_TIP, LM_PINKY_PIP);
+  bool idx = finger_extended(lm, LM_INDEX_MCP, LM_INDEX_PIP, LM_INDEX_DIP, LM_INDEX_TIP);
+  bool mid = finger_extended(lm, LM_MIDDLE_MCP, LM_MIDDLE_PIP, LM_MIDDLE_DIP, LM_MIDDLE_TIP);
+  bool ring = finger_extended(lm, LM_RING_MCP, LM_RING_PIP, LM_RING_DIP, LM_RING_TIP);
+  bool pinky = finger_extended(lm, LM_PINKY_MCP, LM_PINKY_PIP, LM_PINKY_DIP, LM_PINKY_TIP);
   bool thumb = thumb_extended(lm);
 
   GestureID current = GESTURE_NONE;
@@ -110,10 +141,10 @@ GestureID gesture_identify(const HandLandmarks *lm)
   if (!lm->valid)
     return GESTURE_NONE;
 
-  bool idx = finger_extended(lm, LM_INDEX_TIP, LM_INDEX_PIP);
-  bool mid = finger_extended(lm, LM_MIDDLE_TIP, LM_MIDDLE_PIP);
-  bool ring = finger_extended(lm, LM_RING_TIP, LM_RING_PIP);
-  bool pinky = finger_extended(lm, LM_PINKY_TIP, LM_PINKY_PIP);
+  bool idx = finger_extended(lm, LM_INDEX_MCP, LM_INDEX_PIP, LM_INDEX_DIP, LM_INDEX_TIP);
+  bool mid = finger_extended(lm, LM_MIDDLE_MCP, LM_MIDDLE_PIP, LM_MIDDLE_DIP, LM_MIDDLE_TIP);
+  bool ring = finger_extended(lm, LM_RING_MCP, LM_RING_PIP, LM_RING_DIP, LM_RING_TIP);
+  bool pinky = finger_extended(lm, LM_PINKY_MCP, LM_PINKY_PIP, LM_PINKY_DIP, LM_PINKY_TIP);
   bool thumb = thumb_extended(lm);
 
   if (idx && mid && ring && pinky)
