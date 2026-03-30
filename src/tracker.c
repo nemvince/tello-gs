@@ -616,7 +616,7 @@ typedef struct
 {
     float prev_err;
 } PD;
-static PD pd_roll = {0}, pd_throttle = {0}, pd_pitch = {0};
+static PD pd_roll = {0}, pd_throttle = {0};
 
 static int pd_update(PD *pd, float err, float kp, float kd)
 {
@@ -788,7 +788,7 @@ static void *worker_thread(void *arg)
             pthread_mutex_unlock(&out_mtx);
             if (lost_frames >= TRACK_LOST_FRAMES)
             {
-                pd_roll = pd_throttle = pd_pitch = (PD){0};
+                pd_roll = pd_throttle = (PD){0};
                 prev_lm.valid = false;
                 smooth_lm.valid = false;
             }
@@ -834,7 +834,7 @@ static void *worker_thread(void *arg)
             }
             pthread_mutex_unlock(&out_mtx);
             if (lost_frames >= TRACK_LOST_FRAMES)
-                pd_roll = pd_throttle = pd_pitch = (PD){0};
+                pd_roll = pd_throttle = (PD){0};
             continue;
         }
 
@@ -865,24 +865,21 @@ static void *worker_thread(void *arg)
             pcx /= 21.0f;
             pcy /= 21.0f;
 
-            /* Palm size: wrist-to-middle_MCP distance (normalised) */
-            float dx = lm.pts[9].x - lm.pts[0].x;
-            float dy = lm.pts[9].y - lm.pts[0].y;
-            float palm_size = sqrtf(dx * dx + dy * dy);
-
+            /* Track only lateral (roll) and vertical (throttle) axes.
+             * Pitch is left at zero — the drone holds its distance and
+             * mirrors the hand's movement on a parallel 2D plane. */
             float err_roll = (pcx - 0.5f);
             float err_throttle = -(pcy - 0.5f);
-            float err_pitch = (TRACK_TARGET_PALM_SIZE - palm_size);
 
             out.roll = pd_update(&pd_roll, err_roll, TRACK_GAIN_ROLL, TRACK_DERIV_ROLL);
             out.throttle = pd_update(&pd_throttle, err_throttle, TRACK_GAIN_THROTTLE, TRACK_DERIV_THROTTLE);
-            out.pitch = pd_update(&pd_pitch, err_pitch, TRACK_GAIN_PITCH, TRACK_DERIV_PITCH);
+            out.pitch = 0;
             out.yaw = 0;
             out.active = true;
         }
         else
         {
-            pd_roll = pd_throttle = pd_pitch = (PD){0};
+            pd_roll = pd_throttle = (PD){0};
         }
 
         /* ---- Publish results ---- */
@@ -959,7 +956,7 @@ void tracker_set_enabled(bool enabled)
         pthread_mutex_lock(&out_mtx);
         g_output = (TrackerOutput){0, 0, 0, 0, false};
         pthread_mutex_unlock(&out_mtx);
-        pd_roll = pd_throttle = pd_pitch = (PD){0};
+        pd_roll = pd_throttle = (PD){0};
     }
 }
 
