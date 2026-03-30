@@ -10,6 +10,7 @@
 #include "app.h"
 #include "config.h"
 #include "drone.h"
+#include "gesture.h"
 #include "hud.h"
 #include "input.h"
 #include "telemetry.h"
@@ -183,6 +184,16 @@ int main(int argc, char **argv)
     Uint32 now = SDL_GetTicks();
     if (now - last_rc >= RC_RATE_MS)
     {
+      /* --- Gesture commands (debounced) --- */
+      static Uint32 last_gesture_cmd = 0;
+      TrackerDebug dbg = tracker_get_debug();
+      if (dbg.gesture == GESTURE_THUMBS_DOWN &&
+          now - last_gesture_cmd >= GESTURE_DEBOUNCE_MS)
+      {
+        drone_send("land");
+        last_gesture_cmd = now;
+      }
+
       int roll = 0, pitch = 0, throttle = 0, yaw = 0;
 
       /* Tracker overrides manual input when active */
