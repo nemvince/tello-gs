@@ -79,6 +79,9 @@ static volatile bool g_enabled = false;
 /* Worker thread handle */
 static pthread_t worker_tid;
 
+/* Previous-frame landmark state for re-tracking (avoids palm detector) */
+static HandLandmarks prev_lm = {0};
+
 /* ================================================================
  *  ORT helpers
  * ================================================================ */
@@ -117,7 +120,7 @@ static OrtSession *load_session(const char *model_path)
 /* ================================================================
  *  Image preprocessing
  *
- *  All functions produce NCHW float32 output normalised to [-1, 1].
+ *  All functions produce NCHW float32 output normalised to [0, 1].
  *  Bilinear interpolation matches the Python reference:
  *    src_coord = (dst_idx + 0.5) * (src_size / dst_size) - 0.5
  * ================================================================ */
@@ -126,7 +129,7 @@ static OrtSession *load_session(const char *model_path)
  * resize_normalise — resize full RGB24 frame into NCHW float buffer.
  *
  * src: RGB24 row-major, sw×sh
- * dst: float[3 * dh * dw], NCHW layout, values in [-1, 1]
+ * dst: float[3 * dh * dw], NCHW layout, values in [0, 1]
  */
 static void resize_normalise(const uint8_t *src, int sw, int sh,
                              float *dst, int dw, int dh)
@@ -175,8 +178,8 @@ static void resize_normalise(const uint8_t *src, int sw, int sh,
             for (int c = 0; c < 3; c++)
             {
                 float v = p00[c] * w00 + p01[c] * w01 + p10[c] * w10 + p11[c] * w11;
-                /* NCHW: channel-plane first */
-                dst[c * dh * dw + y * dw + x] = v / 127.5f - 1.0f;
+                /* NCHW: channel-plane first, normalised to [0, 1] */
+                dst[c * dh * dw + y * dw + x] = v / 255.0f;
             }
         }
     }
@@ -623,6 +626,74 @@ static int pd_update(PD *pd, float err, float kp, float kd)
     if (v < -100)
         v = -100;
     return v;
+}
+
+/* ================================================================
+ *  Landmark-based re-tracking
+ *
+ *  When we already have valid landmarks from the previous frame,
+ *  compute a bounding box from them and feed that directly to the
+ *  landmark model — skipping the expensive palm detector entirely.
+ *  This is how the real MediaPipe pipeline works and gives much
+ *  more stable, lower-latency tracking.
+ * ================================================================ */
+
+#define RETRACK_PAD 1.8f  /* extra padding around landmark bbox for re-crop */
+
+/*
+ * Compute a PalmBox from existing landmarks (normalised [0,1] coords).
+ * Returns a box that encloses all landmarks with RETRACK_PAD expansion.
+ */
+static PalmBox palmbox_from_landmarks(const HandLandmarks *lm)
+{
+    float min_x = 1.0f, max_x = 0.0f;
+    float min_y = 1.0f, max_y = 0.0f;
+    for (int i = 0; i < 21; i++) {
+        if (lm->pts[i].x < min_x) min_x = lm->pts[i].x;
+        if (lm->pts[i].x > max_x) max_x = lm->pts[i].x;
+        if (lm->pts[i].y < min_y) min_y = lm->pts[i].y;
+        if (lm->pts[i].y > max_y) max_y = lm->pts[i].y;
+    }
+    float w = max_x - min_x;
+    float h = max_y - min_y;
+    float side = fmaxf(w, h) * RETRACK_PAD;
+    PalmBox box;
+    box.cx = (min_x + max_x) * 0.5f;
+    box.cy = (min_y + max_y) * 0.5f;
+    box.w  = side;
+    box.h  = side;
+    box.score = 1.0f;  /* synthetic, not from detector */
+    return box;
+}
+
+/* ================================================================
+ *  EMA smoothing for landmarks
+ *
+ *  Exponential moving average reduces jitter between frames while
+ *  keeping tracking responsive. Alpha=1 means no smoothing (raw),
+ *  Alpha=0.5 means equal weight to new and previous.
+ * ================================================================ */
+
+#define LM_SMOOTH_ALPHA 0.6f  /* higher = more responsive, lower = smoother */
+
+static HandLandmarks smooth_lm = {0};
+
+static void ema_smooth_landmarks(HandLandmarks *lm)
+{
+    if (!smooth_lm.valid) {
+        /* First valid frame — initialise */
+        smooth_lm = *lm;
+        return;
+    }
+    for (int i = 0; i < 21; i++) {
+        lm->pts[i].x = LM_SMOOTH_ALPHA * lm->pts[i].x +
+                        (1.0f - LM_SMOOTH_ALPHA) * smooth_lm.pts[i].x;
+        lm->pts[i].y = LM_SMOOTH_ALPHA * lm->pts[i].y +
+                        (1.0f - LM_SMOOTH_ALPHA) * smooth_lm.pts[i].y;
+        lm->pts[i].z = LM_SMOOTH_ALPHA * lm->pts[i].z +
+                        (1.0f - LM_SMOOTH_ALPHA) * smooth_lm.pts[i].z;
+    }
+    smooth_lm = *lm;
 }
 
 /* ================================================================
