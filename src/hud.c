@@ -6,6 +6,7 @@
 #include "telemetry.h"
 #include "drone.h"
 #include "gesture.h"
+#include "tracker.h"
 #include "config.h"
 
 #include <math.h>
@@ -175,9 +176,36 @@ void hud_draw(SDL_Renderer *r, TTF_Font *font, TTF_Font *font_sm,
   draw_text(r, font_sm, ww - SX(110), wh - SY(24), white,
             "TOF %dcm", t.tof);
 
-  /* --- Tracking mode indicator --- */
-  if (tracking)
-    draw_text(r, font_sm, SX(10), SY(110), green, "TRACKING");
+  /* --- Tracking mode indicator + debug --- */
+  TrackerDebug dbg = tracker_get_debug();
+  {
+    SDL_Color trk_col = tracking ? green : yellow;
+    draw_text(r, font_sm, SX(10), SY(110), trk_col,
+              tracking ? "TRACKING ON" : "TRACKING OFF");
+    draw_text(r, font_sm, SX(10), SY(126), white,
+              "PALM %.2f(raw %.2f) PRES %.2f LOST %d",
+              dbg.palm_score, dbg.palm_best_raw, dbg.hand_presence, dbg.lost_frames);
+    const char *gname = gesture_name((GestureID)dbg.gesture);
+    draw_text(r, font_sm, SX(10), SY(142), cyan,
+              "GESTURE: %s", gname[0] ? gname : "none");
+  }
+
+  /* Palm bounding box — always drawn when a palm is detected (green = landmarks ok, orange = pending) */
+  if (dbg.palm_score > 0.0f)
+  {
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    int bx = (int)((dbg.box_cx - dbg.box_w * 0.5f) * ww);
+    int by = (int)((dbg.box_cy - dbg.box_h * 0.5f) * wh);
+    int bw = (int)(dbg.box_w * ww);
+    int bh = (int)(dbg.box_h * wh);
+    SDL_Color box_col = (lm && lm->valid) ? green : orange;
+    SDL_SetRenderDrawColor(r, box_col.r, box_col.g, box_col.b, 200);
+    SDL_Rect box_rect = {bx, by, bw, bh};
+    SDL_RenderDrawRect(r, &box_rect);
+    /* draw a second pixel-offset rect for thickness */
+    SDL_Rect box_rect2 = {bx + 1, by + 1, bw - 2, bh - 2};
+    SDL_RenderDrawRect(r, &box_rect2);
+  }
 
   /* --- Hand skeleton overlay --- */
   if (lm && lm->valid)
@@ -207,17 +235,12 @@ void hud_draw(SDL_Renderer *r, TTF_Font *font, TTF_Font *font_sm,
 
     /* Gesture label above wrist */
     {
-      extern GestureID gesture_classify(const HandLandmarks *, uint32_t);
-      /* Re-use the last classified gesture from the tracker snapshot.
-         We approximate by re-classifying with t=0 (no debounce fires). */
-      GestureID g = gesture_classify(lm, 0);
+      GestureID g = gesture_identify(lm);
       const char *gname = gesture_name(g);
-      if (gname[0])
-      {
-        int wx = (int)(lm->pts[0].x * ww);
-        int wy = (int)(lm->pts[0].y * wh) - SY(22);
-        draw_text(r, font_sm, wx - SX(30), wy, cyan, "%s", gname);
-      }
+      int wx = (int)(lm->pts[0].x * ww);
+      int wy = (int)(lm->pts[0].y * wh) - SY(22);
+      draw_text(r, font_sm, wx - SX(30), wy, cyan, "%s",
+                gname[0] ? gname : "HAND");
     }
   }
 

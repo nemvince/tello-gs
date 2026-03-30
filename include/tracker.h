@@ -47,5 +47,18 @@ TrackerOutput tracker_get_output(void);
 /* Thread-safe snapshot of the latest detected landmarks (for HUD). */
 HandLandmarks tracker_get_landmarks(void);
 
+/* Debug info updated every frame - useful for diagnosing detection failures. */
+typedef struct
+{
+    float palm_score;    /* confidence of winning detection (0 = none passed threshold) */
+    float palm_best_raw; /* unconditional best sigmoid score this frame */
+    float hand_presence; /* 0..1, landmark model hand-presence score */
+    int gesture;         /* GestureID of current detected gesture */
+    int lost_frames;     /* consecutive frames with no palm */
+    /* palm bounding box in normalised [0,1] frame coords (valid when palm_score>0) */
+    float box_cx, box_cy, box_w, box_h;
+} TrackerDebug;
+TrackerDebug tracker_get_debug(void);
+
 /* Called once from main() during shutdown. */
 void tracker_cleanup(void);

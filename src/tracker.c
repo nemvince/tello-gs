@@ -2,10 +2,13 @@
  * tracker.c — hand-tracking inference worker using onnxruntime C API.
  *
  * Pipeline (runs in a dedicated worker thread):
- *   1. Palm detector  (192×192 RGB → bounding-box NMS)
- *   2. Landmark model (224×224 RGB crop → 21 3-D landmarks)
- *   3. Gesture classification (gesture.h)
+ *   1. Palm detector  (192×192 NCHW → SSD anchor decode → best box)
+ *   2. Landmark model (224×224 NCHW crop → 21 3-D landmarks)
+ *   3. Read-only gesture identification (never sends drone commands)
  *   4. PD controller  → TrackerOutput stored atomically
+ *
+ * SAFETY: This module NEVER calls drone_send(). All drone commands
+ * originate exclusively from main.c user input handlers.
  *
  * Threading contract
  *   tracker_process_frame()  — video thread: copies frame, signals worker.
@@ -23,7 +26,6 @@
 #include "app.h"
 
 #include <onnxruntime_c_api.h>
-#include <SDL2/SDL.h> /* SDL_GetTicks */
 
 #include <math.h>
 #include <pthread.h>
@@ -33,7 +35,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ---- ORT globals ---- */
+/* ================================================================
+ *  ONNX Runtime globals
+ * ================================================================ */
 
 static const OrtApi *ort = NULL;
 static OrtEnv *ort_env = NULL;
@@ -41,7 +45,9 @@ static OrtSession *palm_session = NULL;
 static OrtSession *lmark_session = NULL;
 static OrtMemoryInfo *mem_info = NULL;
 
-/* ---- Frame double-buffer ---- */
+/* ================================================================
+ *  Frame double-buffer (video thread → worker thread)
+ * ================================================================ */
 
 typedef struct
 {
@@ -49,27 +55,33 @@ typedef struct
     int w, h;
 } Frame;
 
-static Frame frames[2];   /* ping-pong buffer */
-static int write_idx = 0; /* which slot video thread writes to */
+static Frame frames[2];
+static int write_idx = 0;
 static pthread_mutex_t frame_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t frame_cv = PTHREAD_COND_INITIALIZER;
 static bool frame_pending = false;
 
-/* ---- Shared output (worker writes, main thread reads) ---- */
+/* ================================================================
+ *  Shared output (worker writes, main/HUD reads)
+ * ================================================================ */
 
 static pthread_mutex_t out_mtx = PTHREAD_MUTEX_INITIALIZER;
 static TrackerOutput g_output = {0, 0, 0, 0, false};
-static HandLandmarks g_landmarks;
+static HandLandmarks g_landmarks = {0};
+static TrackerDebug g_debug = {0};
 
-/* ---- Enable flag ---- */
+/* ================================================================
+ *  Enable flag — only affects PD controller output, NOT inference
+ * ================================================================ */
 
 static volatile bool g_enabled = false;
 
-/* ---- Worker thread ---- */
-
+/* Worker thread handle */
 static pthread_t worker_tid;
 
-/* ---- ORT helpers ---- */
+/* ================================================================
+ *  ORT helpers
+ * ================================================================ */
 
 #define ORT_CHECK(expr)                                                   \
     do                                                                    \
@@ -102,90 +114,224 @@ static OrtSession *load_session(const char *model_path)
     return session;
 }
 
-/* ---- Image preprocessing ---- */
+/* ================================================================
+ *  Image preprocessing
+ *
+ *  All functions produce NCHW float32 output normalised to [-1, 1].
+ *  Bilinear interpolation matches the Python reference:
+ *    src_coord = (dst_idx + 0.5) * (src_size / dst_size) - 0.5
+ * ================================================================ */
 
-/* Resize RGB24 src (sw×sh) into dst (dw×dh) using bilinear interpolation,
- * then normalise to [-1,1] float32. */
+/*
+ * resize_normalise — resize full RGB24 frame into NCHW float buffer.
+ *
+ * src: RGB24 row-major, sw×sh
+ * dst: float[3 * dh * dw], NCHW layout, values in [-1, 1]
+ */
 static void resize_normalise(const uint8_t *src, int sw, int sh,
                              float *dst, int dw, int dh)
 {
-    float sx = (float)sw / dw;
-    float sy = (float)sh / dh;
+    const float scale_x = (float)sw / dw;
+    const float scale_y = (float)sh / dh;
+
     for (int y = 0; y < dh; y++)
     {
+        float fy = (y + 0.5f) * scale_y - 0.5f;
+        int y0 = (int)floorf(fy);
+        int y1 = y0 + 1;
+        float dy = fy - y0;
+        if (y0 < 0)
+        {
+            y0 = 0;
+            dy = 0.0f;
+        }
+        if (y1 >= sh)
+            y1 = sh - 1;
+
         for (int x = 0; x < dw; x++)
         {
-            float fx = (x + 0.5f) * sx - 0.5f;
-            float fy = (y + 0.5f) * sy - 0.5f;
-            int x0 = (int)fx;
-            if (x0 < 0)
-                x0 = 0;
-            int y0 = (int)fy;
-            if (y0 < 0)
-                y0 = 0;
+            float fx = (x + 0.5f) * scale_x - 0.5f;
+            int x0 = (int)floorf(fx);
             int x1 = x0 + 1;
+            float dx = fx - x0;
+            if (x0 < 0)
+            {
+                x0 = 0;
+                dx = 0.0f;
+            }
             if (x1 >= sw)
                 x1 = sw - 1;
-            int y1 = y0 + 1;
-            if (y1 >= sh)
-                y1 = sh - 1;
-            float dx = fx - x0, dy = fy - y0;
+
+            const uint8_t *p00 = src + (y0 * sw + x0) * 3;
+            const uint8_t *p01 = src + (y0 * sw + x1) * 3;
+            const uint8_t *p10 = src + (y1 * sw + x0) * 3;
+            const uint8_t *p11 = src + (y1 * sw + x1) * 3;
+
+            float w00 = (1.0f - dx) * (1.0f - dy);
+            float w01 = dx * (1.0f - dy);
+            float w10 = (1.0f - dx) * dy;
+            float w11 = dx * dy;
+
             for (int c = 0; c < 3; c++)
             {
-                float v = (src[(y0 * sw + x0) * 3 + c] * (1 - dx) * (1 - dy) + src[(y0 * sw + x1) * 3 + c] * dx * (1 - dy) + src[(y1 * sw + x0) * 3 + c] * (1 - dx) * dy + src[(y1 * sw + x1) * 3 + c] * dx * dy);
+                float v = p00[c] * w00 + p01[c] * w01 + p10[c] * w10 + p11[c] * w11;
+                /* NCHW: channel-plane first */
                 dst[c * dh * dw + y * dw + x] = v / 127.5f - 1.0f;
             }
         }
     }
 }
 
-/* Crop a ROI from src (sw×sh) and write resized float crop to dst (dw×dh).
- * cx,cy,cw,ch are the crop box in pixel coords (clamped). */
+/*
+ * crop_resize_normalise — extract a crop from the frame and resize to NCHW.
+ *
+ * The crop box is specified in PIXEL coordinates (cx, cy, cw, ch) where
+ * (cx, cy) is the centre. The crop is clamped to frame bounds, then the
+ * CLAMPED region is resized to dw×dh NCHW float.
+ */
 static void crop_resize_normalise(const uint8_t *src, int sw, int sh,
                                   float *dst, int dw, int dh,
                                   float cx, float cy, float cw, float ch)
 {
-    /* Convert to integer clip region */
-    int x0 = (int)(cx - cw / 2);
+    int x0 = (int)(cx - cw * 0.5f);
+    int y0 = (int)(cy - ch * 0.5f);
+    int x1 = (int)(cx + cw * 0.5f);
+    int y1 = (int)(cy + ch * 0.5f);
     if (x0 < 0)
         x0 = 0;
-    int y0 = (int)(cy - ch / 2);
     if (y0 < 0)
         y0 = 0;
-    int x1 = (int)(cx + cw / 2);
     if (x1 > sw)
         x1 = sw;
-    int y1 = (int)(cy + ch / 2);
     if (y1 > sh)
         y1 = sh;
+
     int rw = x1 - x0, rh = y1 - y0;
     if (rw <= 0 || rh <= 0)
     {
-        memset(dst, 0, dw * dh * 3 * sizeof(float));
+        memset(dst, 0, (size_t)(dw * dh * 3) * sizeof(float));
         return;
     }
 
-    /* Allocate temp crop buffer and fill */
+    /* Copy crop rows into a contiguous RGB24 buffer */
     uint8_t *crop = malloc((size_t)(rw * rh * 3));
     if (!crop)
     {
-        memset(dst, 0, dw * dh * 3 * sizeof(float));
+        memset(dst, 0, (size_t)(dw * dh * 3) * sizeof(float));
         return;
     }
     for (int row = 0; row < rh; row++)
-        memcpy(crop + row * rw * 3, src + ((y0 + row) * sw + x0) * 3, (size_t)(rw * 3));
+        memcpy(crop + row * rw * 3,
+               src + ((y0 + row) * sw + x0) * 3,
+               (size_t)(rw * 3));
+
     resize_normalise(crop, rw, rh, dst, dw, dh);
     free(crop);
 }
 
-/* ---- Palm detection ---- */
+/* ================================================================
+ *  SSD Anchor generation — MediaPipe BlazePalm 192×192
+ *
+ *  MediaPipe's SsdAnchorsCalculator config for palm_detection_lite:
+ *    num_layers=4, strides=[8, 16, 16, 16]
+ *    input_size=192, anchor_offset=0.5, fixed_anchor_size=true
+ *
+ *  This produces:
+ *    stride  8 → grid 24×24, 2 anchors/cell = 1152
+ *    stride 16 → grid 12×12, 6 anchors/cell =  864  (3 layers × 2 each)
+ *    Total: 2016 anchors
+ *
+ *  Each anchor stores (cx, cy) in normalised [0,1] coords.
+ *  IMPORTANT: The loops go y-outer, x-inner to match TFLite's
+ *  row-major feature-map traversal order.
+ * ================================================================ */
+
+#define N_ANCHORS 2016
+
+static float palm_anchors[N_ANCHORS][2]; /* [i][0]=cx, [i][1]=cy */
+
+static void generate_palm_anchors(void)
+{
+    int idx = 0;
+
+    /* stride=8 → 24×24, 2 anchors per cell */
+    for (int y = 0; y < 24; y++)
+        for (int x = 0; x < 24; x++)
+            for (int a = 0; a < 2; a++, idx++)
+            {
+                palm_anchors[idx][0] = (x + 0.5f) / 24.0f; /* cx */
+                palm_anchors[idx][1] = (y + 0.5f) / 24.0f; /* cy */
+            }
+
+    /* stride=16 → 12×12, 6 anchors per cell (3 layers × 2) */
+    for (int y = 0; y < 12; y++)
+        for (int x = 0; x < 12; x++)
+            for (int a = 0; a < 6; a++, idx++)
+            {
+                palm_anchors[idx][0] = (x + 0.5f) / 12.0f;
+                palm_anchors[idx][1] = (y + 0.5f) / 12.0f;
+            }
+
+    /* Verify count */
+    if (idx != N_ANCHORS)
+        fprintf(stderr, "[tracker] BUG: generated %d anchors, expected %d\n",
+                idx, N_ANCHORS);
+}
+
+/* ================================================================
+ *  Palm detection
+ *
+ *  Model: palm_detection_lite.onnx
+ *    Input:  "input"          [1, 3, 192, 192]  NCHW float32 [-1,1]
+ *    Output: "regressors"     [1, 2016, 18]
+ *    Output: "classificators" [1, 2016, 1]       raw logits
+ *
+ *  Regressor layout per anchor (MediaPipe TensorsToDetections):
+ *    [0] = y_center offset (pixels in 192-space)
+ *    [1] = x_center offset
+ *    [2] = h
+ *    [3] = w
+ *    [4..17] = 7 keypoints × (x, y)  — also in 192-pixel space
+ *
+ *  Decoding to normalised [0,1]:
+ *    decoded_cx = anchor_cx + reg[1] / 192
+ *    decoded_cy = anchor_cy + reg[0] / 192
+ *    decoded_w  = reg[3] / 192
+ *    decoded_h  = reg[2] / 192
+ * ================================================================ */
 
 typedef struct
 {
-    float cx, cy, w, h, score;
+    float cx, cy, w, h; /* normalised [0,1] frame coordinates */
+    float score;        /* sigmoid confidence, 0 if no detection */
 } PalmBox;
 
-/* Run palm detector on frame. Returns best detection or score=0 on failure. */
+#define PALM_SCORE_THRESHOLD 0.5f
+#define PALM_NMS_IOU_THRESH 0.3f
+
+static float box_iou(float ax, float ay, float aw, float ah,
+                     float bx, float by, float bw, float bh)
+{
+    float a_x0 = ax - aw * 0.5f, a_y0 = ay - ah * 0.5f;
+    float a_x1 = ax + aw * 0.5f, a_y1 = ay + ah * 0.5f;
+    float b_x0 = bx - bw * 0.5f, b_y0 = by - bh * 0.5f;
+    float b_x1 = bx + bw * 0.5f, b_y1 = by + bh * 0.5f;
+
+    float ix0 = fmaxf(a_x0, b_x0), iy0 = fmaxf(a_y0, b_y0);
+    float ix1 = fminf(a_x1, b_x1), iy1 = fminf(a_y1, b_y1);
+    float iw = fmaxf(0.0f, ix1 - ix0);
+    float ih = fmaxf(0.0f, iy1 - iy0);
+    float inter = iw * ih;
+    float area_a = aw * ah, area_b = bw * bh;
+    float uni = area_a + area_b - inter;
+    return (uni > 0.0f) ? inter / uni : 0.0f;
+}
+
+/*
+ * Run palm detector. Returns the best NMS-surviving detection,
+ * or a PalmBox with score==0 if nothing found.
+ * The returned box coordinates are normalised [0,1].
+ */
 static PalmBox run_palm_detector(const uint8_t *rgb, int fw, int fh,
                                  float *input_buf)
 {
@@ -193,14 +339,15 @@ static PalmBox run_palm_detector(const uint8_t *rgb, int fw, int fh,
     if (!palm_session)
         return result;
 
-    resize_normalise(rgb, fw, fh, input_buf,
-                     PALM_INPUT_W, PALM_INPUT_H);
+    /* Preprocess: resize full frame → 192×192 NCHW [-1,1] */
+    resize_normalise(rgb, fw, fh, input_buf, PALM_INPUT_W, PALM_INPUT_H);
 
+    /* Create input tensor */
     int64_t input_shape[] = {1, 3, PALM_INPUT_H, PALM_INPUT_W};
     OrtValue *input_tensor = NULL;
     OrtStatus *s = ort->CreateTensorWithDataAsOrtValue(
         mem_info, input_buf,
-        (size_t)(PALM_INPUT_W * PALM_INPUT_H * 3 * sizeof(float)),
+        (size_t)(PALM_INPUT_W * PALM_INPUT_H * 3) * sizeof(float),
         input_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor);
     if (s)
     {
@@ -208,6 +355,7 @@ static PalmBox run_palm_detector(const uint8_t *rgb, int fw, int fh,
         return result;
     }
 
+    /* Run inference */
     const char *in_names[] = {"input"};
     const char *out_names[] = {"regressors", "classificators"};
     OrtValue *outputs[2] = {NULL, NULL};
@@ -222,58 +370,102 @@ static PalmBox run_palm_detector(const uint8_t *rgb, int fw, int fh,
         return result;
     }
 
-    /* boxes: [1, N, 18], scores: [1, N, 1] */
-    float *boxes = NULL, *scores = NULL;
-    OrtStatus *s2;
-    s2 = ort->GetTensorMutableData(outputs[0], (void **)&boxes);
-    if (s2)
-        ort->ReleaseStatus(s2);
-    s2 = ort->GetTensorMutableData(outputs[1], (void **)&scores);
-    if (s2)
-        ort->ReleaseStatus(s2);
+    /* Get raw output pointers: regressors [1,2016,18], classificators [1,2016,1] */
+    float *regressors = NULL, *classificators = NULL;
+    ORT_CHECK(ort->GetTensorMutableData(outputs[0], (void **)&regressors));
+    ORT_CHECK(ort->GetTensorMutableData(outputs[1], (void **)&classificators));
 
-    OrtTensorTypeAndShapeInfo *info = NULL;
-    s2 = ort->GetTensorTypeAndShape(outputs[1], &info);
-    if (s2)
-        ort->ReleaseStatus(s2);
-    size_t n_boxes = 0;
-    s2 = ort->GetDimensionsCount(info, &n_boxes); /* misuse: get element count */
-    if (s2)
-        ort->ReleaseStatus(s2);
+    /*
+     * Phase 1: Collect all detections above threshold.
+     * Apply sigmoid to raw logits, decode box from anchor offsets.
+     */
+    typedef struct
     {
-        size_t elem_count = 0;
-        s2 = ort->GetTensorShapeElementCount(info, &elem_count);
-        if (s2)
-            ort->ReleaseStatus(s2);
-        n_boxes = elem_count;
+        float cx, cy, w, h, score;
+    } Det;
+    Det dets[64]; /* more than enough for a single hand */
+    int n_dets = 0;
+
+    float best_raw = 0.0f; /* unconditional best for debug */
+
+    for (int i = 0; i < N_ANCHORS; i++)
+    {
+        float sc = 1.0f / (1.0f + expf(-classificators[i]));
+        if (sc > best_raw)
+            best_raw = sc;
+
+        if (sc < PALM_SCORE_THRESHOLD)
+            continue;
+        if (n_dets >= 64)
+            break;
+
+        float *b = regressors + i * 18;
+        float cx = palm_anchors[i][0] + b[1] / (float)PALM_INPUT_W;
+        float cy = palm_anchors[i][1] + b[0] / (float)PALM_INPUT_H;
+        float w = fabsf(b[3]) / (float)PALM_INPUT_W;
+        float h = fabsf(b[2]) / (float)PALM_INPUT_H;
+
+        dets[n_dets++] = (Det){cx, cy, w, h, sc};
     }
-    ort->ReleaseTensorTypeAndShapeInfo(info);
 
-    /* Sigmoid + pick best */
-    float best_score = 0.5f; /* min confidence threshold */
-    int best_i = -1;
-    for (size_t i = 0; i < n_boxes; i++)
+    /* Publish unconditional best score to debug */
+    pthread_mutex_lock(&out_mtx);
+    g_debug.palm_best_raw = best_raw;
+    pthread_mutex_unlock(&out_mtx);
+
+    /* Phase 2: Greedy NMS — sort by score descending, suppress overlaps */
+    /* Simple insertion sort (n_dets is small) */
+    for (int i = 1; i < n_dets; i++)
     {
-        float sc = 1.0f / (1.0f + expf(-scores[i]));
-        if (sc > best_score)
+        Det key = dets[i];
+        int j = i - 1;
+        while (j >= 0 && dets[j].score < key.score)
         {
-            best_score = sc;
-            best_i = (int)i;
+            dets[j + 1] = dets[j];
+            j--;
+        }
+        dets[j + 1] = key;
+    }
+
+    bool suppressed[64] = {false};
+    for (int i = 0; i < n_dets; i++)
+    {
+        if (suppressed[i])
+            continue;
+        for (int j = i + 1; j < n_dets; j++)
+        {
+            if (suppressed[j])
+                continue;
+            float iou = box_iou(dets[i].cx, dets[i].cy, dets[i].w, dets[i].h,
+                                dets[j].cx, dets[j].cy, dets[j].w, dets[j].h);
+            if (iou > PALM_NMS_IOU_THRESH)
+                suppressed[j] = true;
         }
     }
 
-    if (best_i >= 0)
+    /* Take the top surviving detection */
+    for (int i = 0; i < n_dets; i++)
     {
-        /* boxes layout: [cy, cx, h, w, ...keypoints] in normalised [0,1] */
-        float *b = boxes + best_i * 18;
-        result.cy = b[0] * fh;
-        result.cx = b[1] * fw;
-        result.h = b[2] * fh;
-        result.w = b[3] * fw;
-        result.score = best_score;
-        /* Expand box a little for a stable crop */
-        result.w *= 1.4f;
-        result.h *= 1.4f;
+        if (!suppressed[i])
+        {
+            result.cx = dets[i].cx;
+            result.cy = dets[i].cy;
+            result.w = dets[i].w;
+            result.h = dets[i].h;
+            result.score = dets[i].score;
+            break;
+        }
+    }
+
+    /* Store normalised box in debug */
+    if (result.score > 0.0f)
+    {
+        pthread_mutex_lock(&out_mtx);
+        g_debug.box_cx = result.cx;
+        g_debug.box_cy = result.cy;
+        g_debug.box_w = result.w;
+        g_debug.box_h = result.h;
+        pthread_mutex_unlock(&out_mtx);
     }
 
     ort->ReleaseValue(outputs[0]);
@@ -281,25 +473,53 @@ static PalmBox run_palm_detector(const uint8_t *rgb, int fw, int fh,
     return result;
 }
 
-/* ---- Landmark inference ---- */
+/* ================================================================
+ *  Landmark inference
+ *
+ *  Model: hand_landmark_lite.onnx
+ *    Input:  "input"      [1, 3, 224, 224]  NCHW float32 [-1,1]
+ *    Output: "Identity"   [1, 63]  = 21 landmarks × (x, y, z)
+ *    Output: "Identity_1" [1, 1]   = hand presence logit
+ *
+ *  Landmark coordinates are in 224-pixel crop space.
+ *  Projection to normalised frame coords:
+ *    frame_x = (crop_x0 + lm_x / 224 * crop_w) / frame_w
+ *    frame_y = (crop_y0 + lm_y / 224 * crop_h) / frame_h
+ *
+ *  The crop box passed in is in NORMALISED coords [0,1].
+ *  We expand it by CROP_SCALE for stability before cropping.
+ * ================================================================ */
+
+#define CROP_SCALE 1.5f /* expand palm box for landmark crop */
+#define PRESENCE_THRESH 0.5f
 
 static bool run_landmark_model(const uint8_t *rgb, int fw, int fh,
-                               const PalmBox *box,
+                               const PalmBox *palm,
                                float *input_buf,
                                HandLandmarks *out_lm)
 {
+    out_lm->valid = false;
     if (!lmark_session)
         return false;
 
+    /* Compute crop in pixel coordinates from normalised palm box.
+     * Use a square crop (max of w,h) expanded by CROP_SCALE. */
+    float side = fmaxf(palm->w, palm->h) * CROP_SCALE;
+    float crop_cx_px = palm->cx * fw;
+    float crop_cy_px = palm->cy * fh;
+    float crop_w_px = side * fw;
+    float crop_h_px = side * fh;
+
     crop_resize_normalise(rgb, fw, fh, input_buf,
                           LMARK_INPUT_W, LMARK_INPUT_H,
-                          box->cx, box->cy, box->w, box->h);
+                          crop_cx_px, crop_cy_px, crop_w_px, crop_h_px);
 
+    /* Create tensor */
     int64_t shape[] = {1, 3, LMARK_INPUT_H, LMARK_INPUT_W};
     OrtValue *input_tensor = NULL;
     OrtStatus *s = ort->CreateTensorWithDataAsOrtValue(
         mem_info, input_buf,
-        (size_t)(LMARK_INPUT_W * LMARK_INPUT_H * 3 * sizeof(float)),
+        (size_t)(LMARK_INPUT_W * LMARK_INPUT_H * 3) * sizeof(float),
         shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor);
     if (s)
     {
@@ -307,8 +527,9 @@ static bool run_landmark_model(const uint8_t *rgb, int fw, int fh,
         return false;
     }
 
+    /* Run */
     const char *in_names[] = {"input"};
-    const char *out_names[] = {"Identity", "Identity_1"}; /* landmarks, presence */
+    const char *out_names[] = {"Identity", "Identity_1"};
     OrtValue *outputs[2] = {NULL, NULL};
 
     s = ort->Run(lmark_session, NULL,
@@ -321,44 +542,70 @@ static bool run_landmark_model(const uint8_t *rgb, int fw, int fh,
         return false;
     }
 
-    /* landmarks: [1, 63] = 21 × xyz normalised to crop */
-    float *lm_raw = NULL;
-    float *presence = NULL;
-    OrtStatus *s2;
-    s2 = ort->GetTensorMutableData(outputs[0], (void **)&lm_raw);
-    if (s2)
-        ort->ReleaseStatus(s2);
-    s2 = ort->GetTensorMutableData(outputs[1], (void **)&presence);
-    if (s2)
-        ort->ReleaseStatus(s2);
+    /* Extract output data */
+    float *lm_raw = NULL;   /* [1, 63] = 21 × (x, y, z) in 224-pixel space */
+    float *presence = NULL; /* [1, 1]  = hand presence logit */
+    ORT_CHECK(ort->GetTensorMutableData(outputs[0], (void **)&lm_raw));
+    ORT_CHECK(ort->GetTensorMutableData(outputs[1], (void **)&presence));
 
     float hand_presence = 1.0f / (1.0f + expf(-presence[0]));
-    bool ok = hand_presence > 0.5f;
 
-    if (ok)
+    /* Publish presence to debug */
+    pthread_mutex_lock(&out_mtx);
+    g_debug.hand_presence = hand_presence;
+    pthread_mutex_unlock(&out_mtx);
+
+    if (hand_presence >= PRESENCE_THRESH)
     {
-        /* Project normalised crop coords back to frame coords */
-        float bx0 = box->cx - box->w / 2.0f;
-        float by0 = box->cy - box->h / 2.0f;
+        /*
+         * Project landmarks from 224-pixel crop space to normalised frame coords.
+         *
+         * The crop_resize_normalise function clamped the crop to frame bounds.
+         * We need the ACTUAL crop top-left in pixels (after clamping) to project correctly.
+         */
+        int crop_x0 = (int)(crop_cx_px - crop_w_px * 0.5f);
+        int crop_y0 = (int)(crop_cy_px - crop_h_px * 0.5f);
+        if (crop_x0 < 0)
+            crop_x0 = 0;
+        if (crop_y0 < 0)
+            crop_y0 = 0;
+
+        int crop_x1 = (int)(crop_cx_px + crop_w_px * 0.5f);
+        int crop_y1 = (int)(crop_cy_px + crop_h_px * 0.5f);
+        if (crop_x1 > fw)
+            crop_x1 = fw;
+        if (crop_y1 > fh)
+            crop_y1 = fh;
+
+        float actual_cw = (float)(crop_x1 - crop_x0);
+        float actual_ch = (float)(crop_y1 - crop_y0);
+
         for (int i = 0; i < 21; i++)
         {
-            out_lm->pts[i].x = (bx0 + lm_raw[i * 3 + 0] / LMARK_INPUT_W * box->w) / fw;
-            out_lm->pts[i].y = (by0 + lm_raw[i * 3 + 1] / LMARK_INPUT_H * box->h) / fh;
-            out_lm->pts[i].z = lm_raw[i * 3 + 2];
+            float lx = lm_raw[i * 3 + 0]; /* x in 224-space */
+            float ly = lm_raw[i * 3 + 1]; /* y in 224-space */
+            float lz = lm_raw[i * 3 + 2];
+
+            /* Map from 224-pixel crop to pixel-space frame coords */
+            float frame_px_x = crop_x0 + (lx / (float)LMARK_INPUT_W) * actual_cw;
+            float frame_px_y = crop_y0 + (ly / (float)LMARK_INPUT_H) * actual_ch;
+
+            /* Normalise to [0,1] */
+            out_lm->pts[i].x = frame_px_x / (float)fw;
+            out_lm->pts[i].y = frame_px_y / (float)fh;
+            out_lm->pts[i].z = lz;
         }
         out_lm->valid = true;
-    }
-    else
-    {
-        out_lm->valid = false;
     }
 
     ort->ReleaseValue(outputs[0]);
     ort->ReleaseValue(outputs[1]);
-    return ok;
+    return out_lm->valid;
 }
 
-/* ---- PD controller state ---- */
+/* ================================================================
+ *  PD controller
+ * ================================================================ */
 
 typedef struct
 {
@@ -368,9 +615,9 @@ static PD pd_roll = {0}, pd_throttle = {0}, pd_pitch = {0};
 
 static int pd_update(PD *pd, float err, float kp, float kd)
 {
-    float out = kp * err + kd * (err - pd->prev_err);
+    float deriv = err - pd->prev_err;
     pd->prev_err = err;
-    int v = (int)out;
+    int v = (int)(kp * err + kd * deriv);
     if (v > 100)
         v = 100;
     if (v < -100)
@@ -378,29 +625,29 @@ static int pd_update(PD *pd, float err, float kp, float kd)
     return v;
 }
 
-/* ---- Worker thread ---- */
+/* ================================================================
+ *  Worker thread
+ * ================================================================ */
 
 static void *worker_thread(void *arg)
 {
     (void)arg;
 
-    /* Pre-allocate inference input buffers */
-    float *palm_buf = malloc(PALM_INPUT_W * PALM_INPUT_H * 3 * sizeof(float));
-    float *lmark_buf = malloc(LMARK_INPUT_W * LMARK_INPUT_H * 3 * sizeof(float));
+    float *palm_buf = malloc((size_t)(PALM_INPUT_W * PALM_INPUT_H * 3) * sizeof(float));
+    float *lmark_buf = malloc((size_t)(LMARK_INPUT_W * LMARK_INPUT_H * 3) * sizeof(float));
     if (!palm_buf || !lmark_buf)
     {
-        fprintf(stderr, "tracker: out of memory\n");
+        fprintf(stderr, "[tracker] out of memory for inference buffers\n");
         free(palm_buf);
         free(lmark_buf);
         return NULL;
     }
 
     int lost_frames = 0;
-    int read_idx = 0;
 
     while (g_running)
     {
-        /* Wait for a new frame */
+        /* Wait for a new frame from the video thread */
         pthread_mutex_lock(&frame_mtx);
         while (!frame_pending && g_running)
             pthread_cond_wait(&frame_cv, &frame_mtx);
@@ -409,74 +656,69 @@ static void *worker_thread(void *arg)
             pthread_mutex_unlock(&frame_mtx);
             break;
         }
-
-        read_idx = 1 - write_idx; /* consume the non-write slot */
+        int read_idx = 1 - write_idx;
         frame_pending = false;
         pthread_mutex_unlock(&frame_mtx);
 
         Frame *f = &frames[read_idx];
-        if (!f->data || !g_enabled)
-        {
-            /* Tracking disabled: publish inactive output */
-            pthread_mutex_lock(&out_mtx);
-            g_output = (TrackerOutput){0, 0, 0, 0, false};
-            memset(&g_landmarks, 0, sizeof(g_landmarks));
-            pthread_mutex_unlock(&out_mtx);
-            pd_roll = pd_throttle = pd_pitch = (PD){0};
+        if (!f->data)
             continue;
-        }
 
-        /* Stage 1: palm detection */
-        PalmBox box = run_palm_detector(f->data, f->w, f->h, palm_buf);
+        /* ---- Stage 1: Palm detection ---- */
+        PalmBox palm = run_palm_detector(f->data, f->w, f->h, palm_buf);
 
-        if (box.score == 0.0f)
+        if (palm.score == 0.0f)
         {
             lost_frames++;
+            pthread_mutex_lock(&out_mtx);
+            g_debug.palm_score = 0.0f;
+            g_debug.hand_presence = 0.0f;
+            g_debug.gesture = GESTURE_NONE;
+            g_debug.lost_frames = lost_frames;
             if (lost_frames >= TRACK_LOST_FRAMES)
             {
-                pthread_mutex_lock(&out_mtx);
                 g_output = (TrackerOutput){0, 0, 0, 0, false};
                 memset(&g_landmarks, 0, sizeof(g_landmarks));
-                pthread_mutex_unlock(&out_mtx);
-                pd_roll = pd_throttle = pd_pitch = (PD){0};
             }
+            pthread_mutex_unlock(&out_mtx);
+            if (lost_frames >= TRACK_LOST_FRAMES)
+                pd_roll = pd_throttle = pd_pitch = (PD){0};
             continue;
         }
         lost_frames = 0;
 
-        /* Stage 2: landmark model */
-        HandLandmarks lm;
-        memset(&lm, 0, sizeof(lm));
-        bool ok = run_landmark_model(f->data, f->w, f->h, &box, lmark_buf, &lm);
+        /* ---- Stage 2: Landmark model ---- */
+        HandLandmarks lm = {0};
+        bool lm_ok = run_landmark_model(f->data, f->w, f->h,
+                                        &palm, lmark_buf, &lm);
 
-        /* Stage 3: gesture classification */
-        uint32_t now_ms = SDL_GetTicks();
-        GestureID gesture = GESTURE_NONE;
-        if (ok)
-            gesture = gesture_classify(&lm, now_ms);
+        /* ---- Stage 3: Gesture identification (READ-ONLY, no drone commands) ---- */
+        GestureID gesture = gesture_identify(&lm);
 
-        /* Stage 4: PD controller — only output RC while open-palm */
+        /* ---- Stage 4: PD controller (only when tracking enabled) ---- */
         TrackerOutput out = {0, 0, 0, 0, false};
-        if (ok && (gesture == GESTURE_OPEN_PALM || gesture == GESTURE_NONE))
+
+        if (g_enabled && lm_ok &&
+            (gesture == GESTURE_OPEN_PALM || gesture == GESTURE_NONE))
         {
-            /* Compute palm centroid from landmarks 0-4 (wrist + thumb) */
-            float pcx = 0, pcy = 0;
-            for (int i = 0; i <= 4; i++)
+            /* Palm centroid from all 21 landmarks */
+            float pcx = 0.0f, pcy = 0.0f;
+            for (int i = 0; i < 21; i++)
             {
                 pcx += lm.pts[i].x;
                 pcy += lm.pts[i].y;
             }
-            pcx /= 5.0f;
-            pcy /= 5.0f;
+            pcx /= 21.0f;
+            pcy /= 21.0f;
 
-            /* Palm size: wrist to middle_MCP Euclidean distance (normalised) */
+            /* Palm size: wrist-to-middle_MCP distance (normalised) */
             float dx = lm.pts[9].x - lm.pts[0].x;
             float dy = lm.pts[9].y - lm.pts[0].y;
             float palm_size = sqrtf(dx * dx + dy * dy);
 
-            float err_roll = (pcx - 0.5f);                          /* + = palm right  → roll right   */
-            float err_throttle = -(pcy - 0.5f);                     /* + = palm up     → climb         */
-            float err_pitch = (TRACK_TARGET_PALM_SIZE - palm_size); /* + = too far → advance */
+            float err_roll = (pcx - 0.5f);
+            float err_throttle = -(pcy - 0.5f);
+            float err_pitch = (TRACK_TARGET_PALM_SIZE - palm_size);
 
             out.roll = pd_update(&pd_roll, err_roll, TRACK_GAIN_ROLL, TRACK_DERIV_ROLL);
             out.throttle = pd_update(&pd_throttle, err_throttle, TRACK_GAIN_THROTTLE, TRACK_DERIV_THROTTLE);
@@ -489,9 +731,14 @@ static void *worker_thread(void *arg)
             pd_roll = pd_throttle = pd_pitch = (PD){0};
         }
 
+        /* ---- Publish results ---- */
         pthread_mutex_lock(&out_mtx);
         g_output = out;
         g_landmarks = lm;
+        g_debug.palm_score = palm.score;
+        g_debug.hand_presence = g_debug.hand_presence; /* already set by run_landmark_model */
+        g_debug.gesture = (int)gesture;
+        g_debug.lost_frames = lost_frames;
         pthread_mutex_unlock(&out_mtx);
     }
 
@@ -500,12 +747,16 @@ static void *worker_thread(void *arg)
     return NULL;
 }
 
-/* ---- Public API ---- */
+/* ================================================================
+ *  Public API
+ * ================================================================ */
 
 void tracker_init(void)
 {
     memset(&g_landmarks, 0, sizeof(g_landmarks));
     memset(&g_output, 0, sizeof(g_output));
+    memset(&g_debug, 0, sizeof(g_debug));
+
     ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
     ORT_CHECK(ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "tello_gs", &ort_env));
     ORT_CHECK(ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mem_info));
@@ -513,13 +764,14 @@ void tracker_init(void)
     palm_session = load_session(PALM_MODEL);
     lmark_session = load_session(LMARK_MODEL);
 
-    if (!palm_session || !lmark_session)
-        fprintf(stderr, "tracker: one or more models failed to load — tracking disabled\n");
+    generate_palm_anchors();
+    fprintf(stderr, "[tracker] %d SSD anchors generated\n", N_ANCHORS);
 
-    /* Allocate frame buffers */
-    frames[0].data = frames[1].data = NULL;
-    frames[0].w = frames[1].w = 0;
-    frames[0].h = frames[1].h = 0;
+    if (!palm_session || !lmark_session)
+        fprintf(stderr, "[tracker] model load failed — tracking disabled\n");
+
+    frames[0] = (Frame){NULL, 0, 0};
+    frames[1] = (Frame){NULL, 0, 0};
 
     pthread_create(&worker_tid, NULL, worker_thread, NULL);
 }
@@ -529,7 +781,6 @@ void tracker_process_frame(const uint8_t *rgb, int w, int h)
     pthread_mutex_lock(&frame_mtx);
     Frame *f = &frames[write_idx];
 
-    /* (Re)allocate if dimensions changed */
     if (!f->data || f->w != w || f->h != h)
     {
         free(f->data);
@@ -540,7 +791,7 @@ void tracker_process_frame(const uint8_t *rgb, int w, int h)
     if (f->data)
         memcpy(f->data, rgb, (size_t)(w * h * 3));
 
-    write_idx = 1 - write_idx; /* flip for worker */
+    write_idx = 1 - write_idx;
     frame_pending = true;
     pthread_cond_signal(&frame_cv);
     pthread_mutex_unlock(&frame_mtx);
@@ -553,8 +804,8 @@ void tracker_set_enabled(bool enabled)
     {
         pthread_mutex_lock(&out_mtx);
         g_output = (TrackerOutput){0, 0, 0, 0, false};
-        memset(&g_landmarks, 0, sizeof(g_landmarks));
         pthread_mutex_unlock(&out_mtx);
+        pd_roll = pd_throttle = pd_pitch = (PD){0};
     }
 }
 
@@ -576,10 +827,18 @@ HandLandmarks tracker_get_landmarks(void)
     return lm;
 }
 
+TrackerDebug tracker_get_debug(void)
+{
+    pthread_mutex_lock(&out_mtx);
+    TrackerDebug d = g_debug;
+    pthread_mutex_unlock(&out_mtx);
+    return d;
+}
+
 void tracker_cleanup(void)
 {
     pthread_mutex_lock(&frame_mtx);
-    frame_pending = true; /* unblock the condvar */
+    frame_pending = true;
     pthread_cond_signal(&frame_cv);
     pthread_mutex_unlock(&frame_mtx);
 
