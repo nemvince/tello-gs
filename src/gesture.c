@@ -1,5 +1,6 @@
 #include "gesture.h"
 #include "config.h"
+#include "settings.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -35,10 +36,10 @@
 static bool finger_extended(const HandLandmarks *lm, int mcp, int pip, int dip, int tip)
 {
   (void)tip;
-  /* Vector PIP→MCP */
+  /* Vector PIP->MCP */
   float ax = lm->pts[mcp].x - lm->pts[pip].x;
   float ay = lm->pts[mcp].y - lm->pts[pip].y;
-  /* Vector PIP→DIP */
+  /* Vector PIP->DIP */
   float bx = lm->pts[dip].x - lm->pts[pip].x;
   float by = lm->pts[dip].y - lm->pts[pip].y;
 
@@ -52,12 +53,12 @@ static bool finger_extended(const HandLandmarks *lm, int mcp, int pip, int dip, 
   /* cos(160°) ≈ -0.94, cos(150°) ≈ -0.87.
    * Bent finger: cos_angle is positive (small angle at PIP).
    * Straight finger: cos_angle is very negative (close to 180°).
-   * Threshold: cos < -0.5 means angle > ~120° → extended. */
+   * Threshold: cos < -0.5 means angle > ~120 deg -> extended. */
   return cos_angle < -0.5f;
 }
 
-/* Thumb extension: use angle at MCP joint (CMC→MCP→IP).
- * Same logic as fingers — if the joint is roughly straight, thumb is out. */
+/* Thumb extension: use angle at MCP joint (CMC->MCP->IP).
+ * Same logic as fingers - if the joint is roughly straight, thumb is out. */
 static bool thumb_extended(const HandLandmarks *lm)
 {
   float ax = lm->pts[LM_THUMB_CMC].x - lm->pts[LM_THUMB_MCP].x;
@@ -107,7 +108,7 @@ GestureID gesture_classify(const HandLandmarks *lm, uint32_t now_ms)
   }
   else if (thumb && !idx && !mid && !ring && !pinky)
   {
-    /* Thumb only — up or down based on tip vs wrist Y */
+    /* Thumb only - up or down based on tip vs wrist Y */
     bool thumb_up = lm->pts[LM_THUMB_TIP].y < lm->pts[LM_WRIST].y;
     current = thumb_up ? GESTURE_THUMBS_UP : GESTURE_THUMBS_DOWN;
   }
@@ -122,7 +123,7 @@ GestureID gesture_classify(const HandLandmarks *lm, uint32_t now_ms)
 
   if (!dbs.fired &&
       (current == GESTURE_THUMBS_UP || current == GESTURE_THUMBS_DOWN) &&
-      (now_ms - dbs.since_ms) >= GESTURE_DEBOUNCE_MS)
+      (now_ms - dbs.since_ms) >= (uint32_t)g_settings.gesture_debounce_ms)
   {
     dbs.fired = true;
     /* NOTE: No drone_send() here. Command gestures are reported as return

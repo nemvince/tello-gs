@@ -87,7 +87,7 @@ void drone_send(const char *cmd)
 {
     if (cmd_sock < 0)
         return;
-    /* Don't flood stderr with rc heartbeats — only log non-rc commands. */
+    /* Don't flood stderr with rc heartbeats - only log non-rc commands. */
     if (strncmp(cmd, "rc ", 3) != 0)
         fprintf(stderr, "[drone] send: %s\n", cmd);
     sendto(cmd_sock, cmd, strlen(cmd), 0,

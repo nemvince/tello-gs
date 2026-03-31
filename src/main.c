@@ -1,5 +1,5 @@
 /*
- * Tello Ground Station — main entry point
+ * Tello Ground Station - main entry point
  * Deps: SDL2, SDL2_ttf, FFmpeg (libavcodec, libavutil, libswscale)
  * Build: make
  */
@@ -9,10 +9,12 @@
 
 #include "app.h"
 #include "config.h"
+#include "config_menu.h"
 #include "drone.h"
 #include "gesture.h"
 #include "hud.h"
 #include "input.h"
+#include "settings.h"
 #include "telemetry.h"
 #include "tracker.h"
 #include "video.h"
@@ -29,6 +31,9 @@ int main(int argc, char **argv)
 {
   (void)argc;
   (void)argv;
+
+  /* ----- Load persistent settings ----- */
+  settings_load();
 
   /* ----- SDL init ----- */
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0)
@@ -115,10 +120,16 @@ int main(int argc, char **argv)
         break;
 
       case SDL_KEYDOWN:
+        /* Feed event to config menu first - it consumes keys when open */
+        if (config_menu_handle_event(&ev))
+          break;
         switch (ev.key.keysym.sym)
         {
         case SDLK_ESCAPE:
           g_running = false;
+          break;
+        case SDLK_F1:
+          config_menu_toggle();
           break;
         case SDLK_t:
           drone_send("takeoff");
@@ -139,6 +150,8 @@ int main(int argc, char **argv)
         break;
 
       case SDL_CONTROLLERBUTTONDOWN:
+        if (config_menu_handle_event(&ev))
+          break;
         switch (ev.cbutton.button)
         {
         case SDL_CONTROLLER_BUTTON_A:
@@ -182,13 +195,13 @@ int main(int argc, char **argv)
 
     /* --- RC at 20 Hz --- */
     Uint32 now = SDL_GetTicks();
-    if (now - last_rc >= RC_RATE_MS)
+    if (!config_menu_is_open() && now - last_rc >= (Uint32)g_settings.rc_rate_ms)
     {
       /* --- Gesture commands (debounced) --- */
       static Uint32 last_gesture_cmd = 0;
       TrackerDebug dbg = tracker_get_debug();
       if (dbg.gesture == GESTURE_THUMBS_DOWN &&
-          now - last_gesture_cmd >= GESTURE_DEBOUNCE_MS)
+          now - last_gesture_cmd >= (Uint32)g_settings.gesture_debounce_ms)
       {
         drone_send("land");
         last_gesture_cmd = now;
@@ -273,6 +286,7 @@ int main(int argc, char **argv)
     HandLandmarks lm = tracker_get_landmarks();
     hud_draw(ren, font, font_sm, ww, wh, gc != NULL,
              &lm, tracker_is_enabled());
+    config_menu_draw(ren, font, font_sm, ww, wh);
     SDL_RenderPresent(ren);
   }
 

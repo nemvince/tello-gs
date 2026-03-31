@@ -23,6 +23,7 @@
 #include "tracker.h"
 #include "gesture.h"
 #include "config.h"
+#include "settings.h"
 #include "app.h"
 
 #include <onnxruntime_c_api.h>
@@ -784,13 +785,13 @@ static void *worker_thread(void *arg)
             g_debug.hand_presence = 0.0f;
             g_debug.gesture = GESTURE_NONE;
             g_debug.lost_frames = lost_frames;
-            if (lost_frames >= TRACK_LOST_FRAMES)
+            if (lost_frames >= g_settings.lost_frames)
             {
                 g_output = (TrackerOutput){0, 0, 0, 0, false};
                 memset(&g_landmarks, 0, sizeof(g_landmarks));
             }
             pthread_mutex_unlock(&out_mtx);
-            if (lost_frames >= TRACK_LOST_FRAMES)
+            if (lost_frames >= g_settings.lost_frames)
             {
                 pd_roll = pd_throttle = pd_pitch = (PD){0};
                 prev_lm.valid = false;
@@ -830,14 +831,14 @@ static void *worker_thread(void *arg)
             g_debug.hand_presence = g_debug.hand_presence;
             g_debug.gesture = GESTURE_NONE;
             g_debug.lost_frames = lost_frames;
-            if (lost_frames >= TRACK_LOST_FRAMES)
+            if (lost_frames >= g_settings.lost_frames)
             {
                 g_output = (TrackerOutput){0, 0, 0, 0, false};
                 memset(&g_landmarks, 0, sizeof(g_landmarks));
                 smooth_lm.valid = false;
             }
             pthread_mutex_unlock(&out_mtx);
-            if (lost_frames >= TRACK_LOST_FRAMES)
+            if (lost_frames >= g_settings.lost_frames)
                 pd_roll = pd_throttle = pd_pitch = (PD){0};
             continue;
         }
@@ -899,7 +900,7 @@ static void *worker_thread(void *arg)
             float dx = lm.pts[9].x - lm.pts[0].x;
             float dy = lm.pts[9].y - lm.pts[0].y;
             float palm_size = sqrtf(dx * dx + dy * dy);
-            float err_pitch = (TRACK_TARGET_PALM_SIZE - palm_size);
+            float err_pitch = (g_settings.target_palm_size - palm_size);
 
             /* Deadzone — don't chase tiny size changes */
             if (fabsf(err_pitch) < PITCH_DEADZONE)
@@ -908,9 +909,9 @@ static void *worker_thread(void *arg)
                 pd_pitch = (PD){0};
             }
 
-            out.roll = pd_update(&pd_roll, err_roll, TRACK_GAIN_ROLL, TRACK_DERIV_ROLL);
-            out.throttle = pd_update(&pd_throttle, err_throttle, TRACK_GAIN_THROTTLE, TRACK_DERIV_THROTTLE);
-            int raw_pitch = pd_update(&pd_pitch, err_pitch, TRACK_GAIN_PITCH, TRACK_DERIV_PITCH);
+            out.roll = pd_update(&pd_roll, err_roll, g_settings.gain_roll, g_settings.deriv_roll);
+            out.throttle = pd_update(&pd_throttle, err_throttle, g_settings.gain_throttle, g_settings.deriv_throttle);
+            int raw_pitch = pd_update(&pd_pitch, err_pitch, g_settings.gain_pitch, g_settings.deriv_pitch);
             /* Clamp pitch to a low max so forward/backward is cautious */
             if (raw_pitch > PITCH_MAX)
                 raw_pitch = PITCH_MAX;

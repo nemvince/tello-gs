@@ -166,6 +166,25 @@ void hud_draw(SDL_Renderer *r, TTF_Font *font, TTF_Font *font_sm,
   draw_text(r, font, ww / 2 - SX(48), wh - SY(66), orange,
             "%03d %s", yaw_pos, dirs[di]);
 
+  /* --- Low battery flash (below 20%) --- */
+  if (t.bat <= 20)
+  {
+    Uint32 ticks = SDL_GetTicks();
+    bool flash_on = (ticks / 500) % 2 == 0;
+    if (flash_on)
+    {
+      const char *warn = "!!! LOW BATTERY !!!";
+      int tw = 0, th = 0;
+      if (font)
+        TTF_SizeText(font, warn, &tw, &th);
+      int wx = (ww - tw) / 2;
+      int wy = wh - SY(68) - th - SY(4);
+      fill_rect(r, wx - SX(8), wy - SY(2), tw + SX(16), th + SY(4),
+                80, 0, 0, 200);
+      draw_text(r, font, wx, wy, red, "%s", warn);
+    }
+  }
+
   /* --- Bottom bar --- */
   fill_rect(r, 0, wh - SY(28), ww, SY(28), 0, 0, 0, 160);
   draw_text(r, font_sm, SX(10), wh - SY(24),
@@ -193,7 +212,7 @@ void hud_draw(SDL_Renderer *r, TTF_Font *font, TTF_Font *font_sm,
               "INFER %.1fms (%.0f FPS)", dbg.inference_ms, fps);
   }
 
-  /* Palm bounding box — always drawn when a palm is detected (green = landmarks ok, orange = pending) */
+  /* Palm bounding box - always drawn when a palm is detected (green = landmarks ok, orange = pending) */
   if (dbg.palm_score > 0.0f)
   {
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
