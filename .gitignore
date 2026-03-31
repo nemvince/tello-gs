@@ -1,5 +1,4 @@
 build
 .venv
 tello_gs
-resources
 models

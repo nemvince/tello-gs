@@ -616,7 +616,7 @@ typedef struct
 {
     float prev_err;
 } PD;
-static PD pd_roll = {0}, pd_throttle = {0};
+static PD pd_roll = {0}, pd_throttle = {0}, pd_pitch = {0};
 
 static int pd_update(PD *pd, float err, float kp, float kd)
 {
@@ -681,7 +681,7 @@ static PalmBox palmbox_from_landmarks(const HandLandmarks *lm)
  *  Alpha=0.5 means equal weight to new and previous.
  * ================================================================ */
 
-#define LM_SMOOTH_ALPHA 0.6f /* higher = more responsive, lower = smoother */
+#define LM_SMOOTH_ALPHA 0.8f /* higher = more responsive, lower = smoother */
 
 static HandLandmarks smooth_lm = {0};
 
@@ -788,7 +788,7 @@ static void *worker_thread(void *arg)
             pthread_mutex_unlock(&out_mtx);
             if (lost_frames >= TRACK_LOST_FRAMES)
             {
-                pd_roll = pd_throttle = (PD){0};
+                pd_roll = pd_throttle = pd_pitch = (PD){0};
                 prev_lm.valid = false;
                 smooth_lm.valid = false;
             }
@@ -834,7 +834,7 @@ static void *worker_thread(void *arg)
             }
             pthread_mutex_unlock(&out_mtx);
             if (lost_frames >= TRACK_LOST_FRAMES)
-                pd_roll = pd_throttle = (PD){0};
+                pd_roll = pd_throttle = pd_pitch = (PD){0};
             continue;
         }
 
@@ -865,21 +865,60 @@ static void *worker_thread(void *arg)
             pcx /= 21.0f;
             pcy /= 21.0f;
 
-            /* Track only lateral (roll) and vertical (throttle) axes.
-             * Pitch is left at zero — the drone holds its distance and
-             * mirrors the hand's movement on a parallel 2D plane. */
+/* Track lateral (roll), vertical (throttle), and distance (pitch).
+ *
+ * Distance keeping uses palm size (wrist→middle-MCP distance) as
+ * a proxy for depth. The gains are much lower than lateral/vertical
+ * so forward/backward motion is slow and cautious.
+ *
+ * If the centroid is near a frame edge, zero that axis so the
+ * drone doesn't keep flying in that direction after the hand
+ * leaves the frame. */
+#define EDGE_MARGIN 0.05f
+#define PITCH_DEADZONE 0.03f /* ignore small palm-size fluctuations */
+#define PITCH_MAX 30         /* cap forward/backward speed */
             float err_roll = (pcx - 0.5f);
             float err_throttle = -(pcy - 0.5f);
 
+            if (pcx < EDGE_MARGIN || pcx > (1.0f - EDGE_MARGIN))
+            {
+                err_roll = 0.0f;
+                pd_roll = (PD){0};
+            }
+            if (pcy < EDGE_MARGIN || pcy > (1.0f - EDGE_MARGIN))
+            {
+                err_throttle = 0.0f;
+                pd_throttle = (PD){0};
+            }
+
+            /* Palm size: wrist-to-middle_MCP distance (normalised) */
+            float dx = lm.pts[9].x - lm.pts[0].x;
+            float dy = lm.pts[9].y - lm.pts[0].y;
+            float palm_size = sqrtf(dx * dx + dy * dy);
+            float err_pitch = (TRACK_TARGET_PALM_SIZE - palm_size);
+
+            /* Deadzone — don't chase tiny size changes */
+            if (fabsf(err_pitch) < PITCH_DEADZONE)
+            {
+                err_pitch = 0.0f;
+                pd_pitch = (PD){0};
+            }
+
             out.roll = pd_update(&pd_roll, err_roll, TRACK_GAIN_ROLL, TRACK_DERIV_ROLL);
             out.throttle = pd_update(&pd_throttle, err_throttle, TRACK_GAIN_THROTTLE, TRACK_DERIV_THROTTLE);
-            out.pitch = 0;
+            int raw_pitch = pd_update(&pd_pitch, err_pitch, TRACK_GAIN_PITCH, TRACK_DERIV_PITCH);
+            /* Clamp pitch to a low max so forward/backward is cautious */
+            if (raw_pitch > PITCH_MAX)
+                raw_pitch = PITCH_MAX;
+            if (raw_pitch < -PITCH_MAX)
+                raw_pitch = -PITCH_MAX;
+            out.pitch = raw_pitch;
             out.yaw = 0;
             out.active = true;
         }
         else
         {
-            pd_roll = pd_throttle = (PD){0};
+            pd_roll = pd_throttle = pd_pitch = (PD){0};
         }
 
         /* ---- Publish results ---- */
@@ -956,7 +995,7 @@ void tracker_set_enabled(bool enabled)
         pthread_mutex_lock(&out_mtx);
         g_output = (TrackerOutput){0, 0, 0, 0, false};
         pthread_mutex_unlock(&out_mtx);
-        pd_roll = pd_throttle = (PD){0};
+        pd_roll = pd_throttle = pd_pitch = (PD){0};
     }
 }
 
