@@ -55,6 +55,7 @@ typedef struct
     float hand_presence; /* 0..1, landmark model hand-presence score */
     int gesture;         /* GestureID of current detected gesture */
     int lost_frames;     /* consecutive frames with no palm */
+    float inference_ms;  /* wall-clock time for the inference pipeline this frame */
     /* palm bounding box in normalised [0,1] frame coords (valid when palm_score>0) */
     float box_cx, box_cy, box_w, box_h;
 } TrackerDebug;

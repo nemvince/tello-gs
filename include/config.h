@@ -39,7 +39,7 @@
 #define TRACK_DERIV_PITCH 15.0f
 
 /* Desired palm size as fraction of frame width (tune = desired hover distance) */
-#define TRACK_TARGET_PALM_SIZE 0.25f
+#define TRACK_TARGET_PALM_SIZE 0.10f
 
 /* Frames without detection before auto-disabling RC override */
 #define TRACK_LOST_FRAMES 30

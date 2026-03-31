@@ -188,6 +188,9 @@ void hud_draw(SDL_Renderer *r, TTF_Font *font, TTF_Font *font_sm,
     const char *gname = gesture_name((GestureID)dbg.gesture);
     draw_text(r, font_sm, SX(10), SY(142), cyan,
               "GESTURE: %s", gname[0] ? gname : "none");
+    float fps = dbg.inference_ms > 0.0f ? 1000.0f / dbg.inference_ms : 0.0f;
+    draw_text(r, font_sm, SX(10), SY(158), white,
+              "INFER %.1fms (%.0f FPS)", dbg.inference_ms, fps);
   }
 
   /* Palm bounding box — always drawn when a palm is detected (green = landmarks ok, orange = pending) */

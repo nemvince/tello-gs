@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ================================================================
  *  ONNX Runtime globals
@@ -744,6 +745,9 @@ static void *worker_thread(void *arg)
         if (!f->data)
             continue;
 
+        struct timespec t_start;
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+
         /*
          * Re-tracking strategy (matches real MediaPipe pipeline):
          *
@@ -922,6 +926,11 @@ static void *worker_thread(void *arg)
         }
 
         /* ---- Publish results ---- */
+        struct timespec t_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+        float inf_ms = (float)(t_end.tv_sec - t_start.tv_sec) * 1000.0f +
+                       (float)(t_end.tv_nsec - t_start.tv_nsec) / 1e6f;
+
         pthread_mutex_lock(&out_mtx);
         g_output = out;
         g_landmarks = lm;
@@ -929,6 +938,7 @@ static void *worker_thread(void *arg)
         g_debug.hand_presence = g_debug.hand_presence; /* already set by run_landmark_model */
         g_debug.gesture = (int)gesture;
         g_debug.lost_frames = lost_frames;
+        g_debug.inference_ms = inf_ms;
         pthread_mutex_unlock(&out_mtx);
     }
 
